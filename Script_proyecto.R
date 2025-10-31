@@ -1,0 +1,663 @@
+#------------------------------------------------------------------------------------------
+
+#Nombre del script: Proyecto_final
+#Autor: Pedro Guillén 
+#Propósito: Estimar la vulnerabilidad a la enfermedad de Chagas
+#Fecha: 27 de Octubre 2025
+#Datos de contacto: pedroguillen174@gmail.com
+
+#---------------------------------------------------------------------------------------
+
+#Cargar las librerías necesarias
+library(rgbif)
+library(TeachingDemos)
+library(dismo)
+library(biomod2)
+library(sp)
+library(raster)
+library(usdm)
+library(foreign)
+library(spocc)
+library(XML)
+library(reshape)
+library(CoordinateCleaner)
+library(sf)
+library(maps)
+library(rnaturalearth)
+library(dplyr)
+library(geodata)
+library(terra)
+library(corrplot)
+library(RColorBrewer)
+library(ggplot2)
+library(stringr)
+library(readxl)
+
+
+# Crear Función para modelado de especies
+modelar_especie_sdm <- function(datos_especie_crudos, nombre_cientifico, my_bioclim_rasters) {
+  
+  cat(paste("Limpiando y modelando:", nombre_cientifico, "\n"))
+  
+# -------------------------------------------------------------------
+# 1. LIMPIEZA Y FORMATEO DE DATOS DE PRESENCIA
+
+  
+  datos_presencia_limpios <- datos_especie_crudos %>%
+    # Filtro de BasisOfRecord, coordenadas nulas y limpieza
+    filter(!is.na(decimalLongitude) & !is.na(decimalLatitude)) %>%
+    filter(basisOfRecord %in% c("HUMAN_OBSERVATION", "PRESERVED_SPECIMEN")) %>%
+    distinct(decimalLatitude, decimalLongitude, .keep_all = TRUE) %>%
+    dplyr::rename(longitude = decimalLongitude, latitude = decimalLatitude) %>%
+    dplyr::select(longitude, latitude)
+  
+  # Verificación de datos mínimos (usando 15 como estándar)
+  if(nrow(datos_presencia_limpios) < 15) { 
+    stop(paste("Insuficientes datos limpios para", nombre_cientifico, ". Se requieren al menos 15 registros."))
+  }
+  
+# -------------------------------------------------------------------
+# 2. GENERACIÓN MANUAL DE PSEUDO-AUSENCIAS
+
+  
+  env_coords_matrix <- terra::xyFromCell(my_bioclim_rasters, 1:terra::ncell(my_bioclim_rasters))
+  env_coords <- as.data.frame(env_coords_matrix)
+  env_coords <- env_coords[complete.cases(env_coords), ]
+  
+  n_pseudo_ausencias <- 10000
+  pa_xy <- dplyr::sample_n(env_coords, n_pseudo_ausencias, replace = FALSE)
+  pa_xy <- dplyr::rename(pa_xy, longitude = x, latitude = y)
+  
+  todas_las_coords <- dplyr::bind_rows(datos_presencia_limpios, pa_xy)
+  pres_abs <- c(rep(1, nrow(datos_presencia_limpios)), rep(0, nrow(pa_xy)))
+  
+  
+# -------------------------------------------------------------------
+# 3. FORMATEO Y MODELADO (BIOMOD2)
+
+  
+  nombre_biomod <- gsub(" ", ".", nombre_cientifico)
+  
+  my_biomod_data <- BIOMOD_FormatingData(
+    resp.var = pres_abs,
+    expl.var = my_bioclim_rasters,
+    resp.xy = todas_las_coords,
+    resp.name = nombre_biomod
+  )
+  
+  my_models <- BIOMOD_Modeling(
+    bm.format = my_biomod_data,
+    modeling.id = paste0("modelo_", nombre_biomod),
+    models = c('RF', 'GLM', 'GAM'),
+    nb.rep = 3,
+    data.split.perc = 80,
+    var.import = 3 # Cálculo de importancia de variables forzado
+  )
+  
+  
+# -------------------------------------------------------------------
+# 4. ENSAMBLE Y PROYECCIÓN
+
+  
+  my_ensemble <- BIOMOD_EnsembleModeling(
+    bm.mod = my_models,
+    models.chosen = 'all',
+    em.by = 'all',
+    em.algo = c('EMmean'),
+    metric.select = c('TSS'),
+    metric.select.thresh = 0.7 # Usar 0.6 para ser menos estricto con la calidad del modelo
+  )
+  
+  my_ensemble_proj <- BIOMOD_EnsembleForecasting(
+    bm.em = my_ensemble,
+    proj.name = paste0('proj_', nombre_biomod),
+    new.env = my_bioclim_rasters
+  )
+  
+  return(my_ensemble_proj)
+}
+
+
+
+dir.create("worldclim_data", showWarnings = FALSE)
+
+my_bioclim_rasters <- geodata::worldclim_country(
+  country = "Mexico",
+  var = "bio",
+  res = 2.5,
+  path = "worldclim_data"
+)
+
+
+# =======================================================================
+# B. LISTA DE ESPECIES Y AUTOMATIZACIÓN (BUCLE)
+# =======================================================================
+
+lista_especies <- c(
+  "Triatoma mexicana",
+  "Triatoma barberi",
+  "Dipetalogaster maxima",
+  "Meccus longipennis",
+  "Meccus pallidipennis",
+  "Baiomys musculus",
+  "Neotoma mexicana"
+)
+
+resultados_sdm <- list()
+
+for (nombre in lista_especies) {
+  
+  tryCatch({
+    cat("\n--- Iniciando:", nombre, " (Nacional) ---\n")
+    
+    # 1. Descargar datos de GBIF
+    datos_gbif_crudos <- occ_search(
+      scientificName = nombre,
+      hasCoordinate = TRUE,
+      hasGeospatialIssue = FALSE
+    )$data
+    
+    # 2. Verificación de seguridad
+    if (is.null(datos_gbif_crudos)) {
+      stop("La descarga de GBIF para esta especie no arrojó ningún dato.")
+    }
+    
+    # 3. Llamar a la función de modelado 
+    mapa_proyeccion <- modelar_especie_sdm(
+      datos_especie_crudos = datos_gbif_crudos, 
+      nombre_cientifico = nombre,
+      my_bioclim_rasters = my_bioclim_rasters 
+    )
+    
+    # 4. Almacenar el mapa de proyección final
+    resultados_sdm[[nombre]] <- mapa_proyeccion
+    
+    cat(paste("PROCESO COMPLETO y guardado para:", nombre, "\n"))
+    
+  }, error = function(e) {
+    cat(paste("!!! ERROR al procesar", nombre, ":", conditionMessage(e), "\n"))
+  })
+}
+
+
+
+
+## =======================================================================
+## VISUALIZACIÓN DE PROYECCIONES INDIVIDUALES
+## =======================================================================
+
+cat("\n--- Visualizando Proyecciones de Ensamble Individuales ---\n")
+
+# 1. Iterar solo sobre los resultados válidos
+for (nombre_especie in names(resultados_sdm)) {
+  
+  proj_out <- resultados_sdm[[nombre_especie]]
+  
+  # Verificar que el objeto sea una proyección válida
+  if (inherits(proj_out, 'BIOMOD.projection.out')) {
+    
+    tryCatch({
+      # Cargar el SpatRaster que contiene las predicciones
+      predicciones_stack <- get_predictions(proj_out)
+      
+      # 2. Encontrar la capa del Ensamble Mean (_EMmean)
+      nombre_capa_ensamble <- names(predicciones_stack)[grep("_EMmean$", names(predicciones_stack))][1]
+      
+      ensemble_raster <- NULL
+      if (length(nombre_capa_ensamble) > 0 && !is.na(nombre_capa_ensamble)) {
+        ensemble_raster <- predicciones_stack[[nombre_capa_ensamble]]
+      } else {
+        # Respaldo: usar la última capa si la búsqueda de nombre falla
+        ensemble_raster <- predicciones_stack[[terra::nlyr(predicciones_stack)]]
+      }
+      
+      if (!is.null(ensemble_raster)) {
+        # 3. Visualizar la proyección
+        plot(
+          ensemble_raster,
+          main = paste("Proyección de Ensamble:", nombre_especie),
+          col = hcl.colors(n = 20, palette = "Plasma", rev = TRUE) 
+        )
+        
+      
+        
+      } else {
+        cat(paste("Advertencia: No se pudo extraer el ráster de ensamble para:", nombre_especie, "\n"))
+      }
+      
+      # Liberar memoria después de cada plot
+      rm(predicciones_stack, ensemble_raster); gc() 
+      
+    }, error = function(e) {
+      cat(paste("Error al visualizar", nombre_especie, ":", conditionMessage(e), "\n"))
+    })
+  }
+}
+
+
+
+
+# =======================================================================
+# C. ANÁLISIS DE RIQUEZA ACUMULADA 
+
+
+# 1. Filtrar la lista, manteniendo solo los objetos de proyección válidos.
+mapas_validos <- resultados_sdm[sapply(resultados_sdm, function(x) inherits(x, 'BIOMOD.projection.out'))]
+
+if (length(mapas_validos) > 1) {
+  cat("\n--- Generando Mapa de Riqueza Acumulada Nacional (En Memoria) ---\n")
+  
+  # --- INICIALIZACIÓN ---
+  proj_out_base <- mapas_validos[[1]]
+  predicciones_base <- get_predictions(proj_out_base)
+  
+  #Tomar la última capa como plantilla
+  mapa_riqueza_acumulada <- predicciones_base[[terra::nlyr(predicciones_base)]] * 0
+  
+  # Liberar la memoria del objeto base
+  rm(proj_out_base, predicciones_base); gc()
+  
+  # 2. Iterar sobre cada resultado, extraer la última capa y sumar
+  for (proj_out in mapas_validos) {
+    
+    tryCatch({
+      
+      # Obtener el SpatRaster que contiene las predicciones
+      predicciones_stack <- get_predictions(proj_out)
+      
+      #Extraer la ÚLTIMA capa (que es el ensamble)
+      ensemble_raster <- predicciones_stack[[terra::nlyr(predicciones_stack)]]
+      
+      # Sumar el ráster de la especie actual al total
+      mapa_riqueza_acumulada <- mapa_riqueza_acumulada + ensemble_raster
+      
+      # Liberar la memoria
+      rm(predicciones_stack, ensemble_raster); gc() 
+      cat(paste("  --> Sumada la riqueza para:", proj_out@sp.name, "\n"))
+      
+    }, error = function(e) {
+      cat(paste("  --> ERROR: Fallo al procesar (puede que la proyección no exista):", proj_out@sp.name, "\n"))
+      
+    })
+  }
+  
+  # 3. Visualizar el resultado final 
+  plot(mapa_riqueza_acumulada, main = "Riqueza Acumulada de Especies (México)")
+  
+} else {
+  cat("\n!!! AVISO FINAL: NINGUNA ESPECIE FUE MODELADA CON ÉXITO.\n")
+}
+
+
+
+# =======================================================================
+# D. DENSIDAD POBLACIONAL Y MARGINACIÓN 
+
+mi_base <- read_excel("D:/Introducción a R/Proyecto_final/IMM_2020.xlsx", sheet = 2)
+ruta_shp_municipal <- "D:/Introducción a R/Proyecto_final/00mun.shp"
+geometrias_municipales <- sf::st_read(ruta_shp_municipal)
+ruta_shp_entidades <- "D:/Introducción a R/Proyecto_final/00ent.shp" 
+entidades_shp <- sf::st_read(ruta_shp_entidades)
+
+
+# --- Estandarizar Claves ---
+
+
+geometrias_municipales <- geometrias_municipales %>%
+  dplyr::select(-any_of("CVE_MUN")) # any_of maneja si la columna no existe
+
+# 2. Renombrar la clave correcta ('CVGEO') a 'CVE_MUN'
+geometrias_municipales <- geometrias_municipales %>%
+  dplyr::rename(CVE_MUN = CVEGEO) %>%
+  # Asegurar que la clave en el shapefile sea de TEXTO (crucial)
+  dplyr::mutate(CVE_MUN = as.character(CVE_MUN))
+
+# 3. Asegurar que la clave en tu mi_base también sea de TEXTO
+mi_base <- mi_base %>% 
+  dplyr::mutate(CVE_MUN = as.character(CVE_MUN))
+
+# --- REALIZAR LA UNIÓN (LEFT JOIN) ---
+mapa_vulnerabilidad_municipal <- geometrias_municipales %>%
+  # Une los datos de mi_base (incluyendo POB_TOT e IMN_2020) a las geometrías
+  dplyr::left_join(mi_base, by = "CVE_MUN")
+
+cat("¡Unión de datos completada! El objeto 'mapa_vulnerabilidad_municipal' ya está creado.\n")
+
+
+# =======================================================================
+# --- 1. CÁLCULO DE ÁREA Y DENSIDAD POBLACIONAL REAL ---
+
+# 1. Transformar a una proyección adecuada para medir área (CRS 3857)
+mapa_vulnerabilidad_municipal_proj <- mapa_vulnerabilidad_municipal %>%
+  sf::st_transform(crs = 3857) 
+
+# 2. Calcular Área y Densidad (Densidad = POB_TOT / Área en km²)
+mapa_final_municipal <- mapa_vulnerabilidad_municipal_proj %>%
+  dplyr::mutate(
+    AREA_KM2 = as.numeric(sf::st_area(geometry)) / 1000000, # Área en km²
+    DENSIDAD_POB = POB_TOT / AREA_KM2 # POB_TOT viene de mi_base
+  ) %>%
+  # 3. Regresar a la proyección original (WGS84, crs=4326) para mapeo
+  sf::st_transform(crs = 4326)
+
+# 4. Limpieza: Filtrar valores faltantes en las variables clave
+mapa_final_municipal_clean <- mapa_final_municipal %>%
+  dplyr::filter(!is.na(IMN_2020) & !is.na(DENSIDAD_POB))
+
+
+# --- 2. GENERACIÓN DEL MAPA DE MARGINACIÓN (Sensibilidad) ---
+
+g1_marginacion <- mapa_final_municipal_clean %>%
+  ggplot(aes(fill = IMN_2020)) +
+  geom_sf(color = "gray80", linewidth = 0.1) +
+  scale_fill_viridis_c(
+    option = "magma",
+    name = "Índice de Marginación (IMM)",
+    direction = -1 
+  ) +
+  labs(
+    title = "Mapa de Sensibilidad: Índice de Marginación Municipal",
+    subtitle = "IMN_2020 (CONAPO)"
+  ) +
+  theme_minimal()
+
+print(g1_marginacion) 
+
+
+# --- 3. GENERACIÓN DEL MAPA DE DENSIDAD POBLACIONAL (Exposición Socio-demográfica) ---
+
+g2_densidad <- mapa_final_municipal_clean %>%
+  ggplot(aes(fill = DENSIDAD_POB)) +
+  geom_sf(color = "gray80", linewidth = 0.1) +
+  scale_fill_viridis_c(
+    option = "turbo", 
+    name = "Hab/km²",
+    trans = "log10" 
+  ) +
+  labs(
+    title = "Mapa de Exposición: Densidad Poblacional Municipal",
+    subtitle = "Calculada como Población Total / Área en km²"
+  ) +
+  theme_minimal()
+
+print(g2_densidad)
+
+
+#Score Vulnerabilidad
+
+geometrias_spatvector <- terra::vect(mapa_final_municipal)
+
+# 2. Extraer y promediar los valores de riqueza para cada polígono municipal
+# La función terra::extract calcula el promedio (fun=mean) de la riqueza dentro de cada municipio.
+riqueza_promedio_municipal_df <- terra::extract(
+  mapa_riqueza_acumulada, 
+  geometrias_spatvector, 
+  fun = mean, 
+  na.rm = TRUE, 
+  method = 'bilinear'
+)
+
+
+# 3. Limpieza y unión de la nueva columna 
+
+
+columna_riqueza_nueva <- names(riqueza_promedio_municipal_df)[2]
+
+# Unir la columna de riqueza promedio al sf final
+mapa_final_vulnerabilidad <- mapa_final_municipal %>%
+  # Usamos bind_cols porque el orden de las filas de terra::extract coincide con el sf
+  bind_cols(RIQUEZA_PROM = riqueza_promedio_municipal_df[[columna_riqueza_nueva]]) %>%
+  # Usar dplyr::select para eliminar la columna ID_MUN
+  dplyr::select(-any_of('ID'))
+
+
+
+# 1. Definir la función de normalización (Min-Max)
+normalizar <- function(x, invertir=FALSE) {
+  min_val <- min(x, na.rm = TRUE)
+  max_val <- max(x, na.rm = TRUE)
+  score <- (x - min_val) / (max_val - min_val)
+  
+  if (invertir) {
+    return(1 - score)
+  } else {
+    return(score)
+  }
+}
+
+# 2. Aplicar normalización (Score 0-1) y calcular el Score de Vulnerabilidad
+
+mapa_score_vulnerabilidad <- mapa_final_vulnerabilidad %>%
+  dplyr::mutate(
+    # Exposición (Ecológica y Socio)
+    RIQUEZA_NORM = normalizar(RIQUEZA_PROM),
+    DENSIDAD_NORM = normalizar(DENSIDAD_POB),
+    
+    # Sensibilidad
+    MARGINACION_NORM = normalizar(IMN_2020),
+    
+    # Capacidad Adaptativa (SIMULACIÓN)
+    
+    CAP_ADAPT_NORM = 0.5, # Valor neutro si se omite CA
+    
+    # Fórmula: (E_eco + E_soc) + S - CA
+    SCORE_VULNERABILIDAD_CRUDO = (RIQUEZA_NORM + DENSIDAD_NORM) + MARGINACION_NORM - CAP_ADAPT_NORM
+  ) %>%
+  # 3. Normalizar el Score Final Crudo a un rango de 0 a 1
+  dplyr::mutate(
+    SCORE_VULNERABILIDAD_FINAL = normalizar(SCORE_VULNERABILIDAD_CRUDO)
+  )
+
+
+# Filtrar solo los municipios con un score válido
+mapa_vulnerabilidad_final_clean <- mapa_score_vulnerabilidad %>%
+  dplyr::filter(!is.na(SCORE_VULNERABILIDAD_FINAL))
+
+g3_vulnerabilidad_final <- mapa_vulnerabilidad_final_clean %>%
+  ggplot(aes(fill = SCORE_VULNERABILIDAD_FINAL)) +
+  geom_sf(color = "gray80", linewidth = 0.1) +
+  scale_fill_viridis_c(
+    option = "inferno", 
+    name = "Score (0=Bajo, 1=Alto)",
+    direction = 1 # Alto valor = colores más cálidos (rojo)
+  ) +
+  labs(
+    title = "Score Final de Vulnerabilidad a Nivel Municipal",
+    subtitle = "Integración de Riqueza Biológica, Densidad y Marginación"
+  ) +
+  theme_minimal()
+
+print(g3_vulnerabilidad_final)
+
+
+
+#---------------------------------------------------------------------------------
+#4.Matriz de Correlación Vulnerabilidad vs variables climáticas
+
+# 4.1 Crear el SpatVector del mapa de vulnerabilidad y mantener la clave CVE_MUN
+geometrias_score_spatvector <- terra::vect(mapa_score_vulnerabilidad)
+geometrias_score_spatvector$ID_MUN_TEMP <- mapa_score_vulnerabilidad$CVE_MUN 
+
+# 2. Extraer el promedio de las variables bioclimáticas para cada municipio
+datos_bioclim_extraidos <- terra::extract(
+  my_bioclim_rasters, 
+  geometrias_score_spatvector, 
+  fun = mean, 
+  na.rm = TRUE,
+  method = 'bilinear'
+)
+
+# 3. Preparar el DF de bioclimáticas para la unión
+df_bioclim_limpio <- datos_bioclim_extraidos %>%
+  # Usar la clave temporal para mapear las filas
+  dplyr::mutate(CVE_MUN = geometrias_score_spatvector$ID_MUN_TEMP[ID]) %>%
+  dplyr::select(-ID) 
+
+# 4. Preparar el DF de vulnerabilidad
+df_vulnerabilidad <- mapa_score_vulnerabilidad %>%
+  sf::st_drop_geometry() %>%
+  dplyr::select(CVE_MUN, SCORE_VULNERABILIDAD_FINAL)
+
+# 5. UNIÓN EXPLÍCITA: left_join desde vulnerabilidad. 
+
+df_score_y_bioclim <- df_vulnerabilidad %>%
+  dplyr::left_join(df_bioclim_limpio, by = "CVE_MUN") %>%
+  # Eliminar filas con cualquier NA (necesario para el cálculo de correlación)
+  na.omit() %>%
+  # Eliminar la clave CVE_MUN
+  dplyr::select(-CVE_MUN)
+
+
+cat(paste("Filas finales para correlación:", nrow(df_score_y_bioclim), "\n"))
+
+
+
+# 1. Calcular la matriz de correlación
+cor_matrix <- cor(df_score_y_bioclim, method = "pearson")
+
+# 2. Extraer los p-valores
+cor_test_result <- Hmisc::rcorr(as.matrix(df_score_y_bioclim), type="pearson")
+p_matrix <- cor_test_result$P
+
+# 3. Establecer las etiquetas
+etiquetas <- c("VULNERABILIDAD", paste0("BIO", 1:19))
+if (ncol(cor_matrix) == 20) {
+  colnames(cor_matrix) <- etiquetas
+  rownames(cor_matrix) <- etiquetas
+}
+
+# 4. Generar el Gráfico de Matriz de Correlación con ajustes de tamaño (cex)
+
+corrplot(
+  cor_matrix, 
+  method = "color",          
+  type = "upper",            
+  order = "hclust",          
+  addCoef.col = "black",     
+  tl.col = "black",          
+  tl.srt = 45,               
+  tl.cex = 0.65,              
+  number.cex = 0.5,           
+  mar = c(0, 0, 1, 0),        
+  p.mat = p_matrix,          
+  sig.level = 0.05,          
+  insig = "blank",           
+  title = "Matriz de Correlación: Score de Vulnerabilidad vs. Variables Climáticas"
+)
+
+
+
+
+
+# --- 1. CONFIGURACIÓN DE PROYECCIÓN ESTÁNDAR ---
+
+CRS_ESTANDAR <- 4326 
+
+# --- 2. PREPARACIÓN Y LIMPIEZA DE LA MÁSCARA DE ENTIDADES ---
+ruta_shp_entidades <- "D:/Introducción a R/Proyecto_final/00ent.shp" 
+entidades_shp <- sf::st_read(ruta_shp_entidades)
+
+# Filtrar, limpiar y asegurar la proyección
+poligonos_cdmx_edomex <- entidades_shp %>%
+  sf::st_transform(crs = CRS_ESTANDAR) %>% # Estandarizar proyección
+  dplyr::mutate(CVE_ENT = as.character(CVE_ENT)) %>%
+  dplyr::filter(CVE_ENT %in% c("09", "15"))
+
+mascara_corte <- poligonos_cdmx_edomex %>%
+  sf::st_union()
+
+# --- 3. PREPARACIÓN Y LIMPIEZA DEL MAPA MUNICIPAL ---
+# Asegurar que el mapa de vulnerabilidad final esté en la misma proyección
+mapa_vulnerabilidad_limpio <- mapa_vulnerabilidad_final_clean %>%
+  sf::st_transform(crs = CRS_ESTANDAR) # Estandarizar proyección
+
+# --- 4. APLICAR FILTRADO POR CENTROIDE (MÉTODO ROBUSTO) ---
+
+# a) Crear los centroides (puntos centrales) del mapa municipal
+centroides_municipales <- mapa_vulnerabilidad_limpio %>%
+  sf::st_centroid()
+
+# b) Identificar qué centroides caen DENTRO de la máscara (st_within)
+
+municipios_a_mantener <- centroides_municipales[mascara_corte, op = st_within]
+
+# c) Filtrar el mapa de vulnerabilidad original usando los índices de los centroides
+mapa_vulnerabilidad_cortado <- mapa_vulnerabilidad_limpio[municipios_a_mantener, ]
+
+# -----------------------------------------------------------
+# DIAGNÓSTICO FINAL (debe ser > 0)
+cat(paste("Total de filas en el objeto recortado (después de CRS/Centroide):", 
+          nrow(mapa_vulnerabilidad_cortado), "\n"))
+# -----------------------------------------------------------
+
+
+
+
+#CREACIÓN DE CLAVE ESTATAL Y TOPS
+
+df_top_vulnerabilidad <- mapa_vulnerabilidad_cortado %>%
+  sf::st_drop_geometry() %>%
+  dplyr::mutate(
+    # La clave de entidad se crea a partir de los dos primeros dígitos de CVE_MUN
+    CVE_ENT = str_sub(CVE_MUN, 1, 2)
+  ) %>%
+  # Usamos las columnas de nombre existentes (NOM_ENT, NOM_MUN)
+  dplyr::select(CVE_ENT, NOM_ENT, NOM_MUN, SCORE_VULNERABILIDAD_FINAL) %>% 
+  na.omit() %>%
+  dplyr::arrange(desc(SCORE_VULNERABILIDAD_FINAL))
+
+# --- A. Top 10 Estado de México (CVE_ENT == "15") ---
+top10_edomex <- df_top_vulnerabilidad %>%
+  dplyr::filter(CVE_ENT == "15") %>%
+  head(10) %>%
+  dplyr::mutate(NOM_MUN = forcats::fct_reorder(NOM_MUN, SCORE_VULNERABILIDAD_FINAL))
+
+# --- B. Top 10 Ciudad de México (CVE_ENT == "09") ---
+top10_cdmx <- df_top_vulnerabilidad %>%
+  dplyr::filter(CVE_ENT == "09") %>%
+  head(10) %>%
+  dplyr::mutate(NOM_MUN = forcats::fct_reorder(NOM_MUN, SCORE_VULNERABILIDAD_FINAL))
+
+g6_top10_edomex <- top10_edomex %>%
+  ggplot(aes(x = NOM_MUN, y = SCORE_VULNERABILIDAD_FINAL, fill = SCORE_VULNERABILIDAD_FINAL)) +
+  geom_col() +
+  scale_fill_viridis_c(option = "inferno", direction = -1, guide = "none") + 
+  coord_flip() + 
+  labs(
+    title = "Top 10 Municipios con Mayor Vulnerabilidad (Estado de México)",
+    subtitle = "Score Final (Integración de Riesgos Biológicos, Socioeconómicos y CA)",
+    x = "Municipio",
+    y = "Score de Vulnerabilidad (0 - 1)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.y = element_text(size = 10)
+  )
+
+print(g6_top10_edomex)
+
+
+
+g7_top10_cdmx <- top10_cdmx %>%
+  ggplot(aes(x = NOM_MUN, y = SCORE_VULNERABILIDAD_FINAL, fill = SCORE_VULNERABILIDAD_FINAL)) +
+  geom_col() +
+  scale_fill_viridis_c(option = "inferno", direction = -1, guide = "none") + 
+  coord_flip() + 
+  labs(
+    title = "Top 10 Alcaldías con Mayor Vulnerabilidad (Ciudad de México)",
+    subtitle = "Score Final (Integración de Riesgos Biológicos, Socioeconómicos y CA)",
+    x = "Alcaldía",
+    y = "Score de Vulnerabilidad (0 - 1)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.y = element_text(size = 10)
+  )
+
+print(g7_top10_cdmx)
+
+
+
+
